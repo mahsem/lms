@@ -149,12 +149,14 @@
 							/>
 							<FormControl
 								type="date"
+								:format="dateFormat"
 								v-model="certificate.issue_date"
 								:disabled="!userIsEvaluator()"
 								:label="__('Issue Date')"
 							/>
 							<FormControl
 								type="date"
+								:format="dateFormat"
 								v-model="certificate.expiry_date"
 								:disabled="!userIsEvaluator()"
 								:label="__('Expiry Date')"
@@ -188,6 +190,7 @@ import BooleanSwitch from '@/components/Controls/BooleanSwitch.vue'
 import { inject, reactive, watch, ref, computed } from 'vue'
 import { formatTime } from '@/utils'
 import { formatTimezone } from '@/utils/timezone'
+import { getDateFormat } from '@/utils/format'
 import Link from '@/components/Controls/Link.vue'
 import { openExternal } from '@/utils/openExternal'
 
@@ -195,6 +198,7 @@ const show = defineModel()
 const user = inject('$user')
 const dayjs = inject('$dayjs')
 const activeTab = ref('evaluation')
+const dateFormat = getDateFormat()
 const showCertification = ref(false)
 const evaluation = reactive({})
 const certificate = reactive({})
@@ -266,6 +270,7 @@ const evaluationDetails = createResource({
 			filters: {
 				member: props.event.member,
 				course: props.event.course,
+				batch_name: props.event.batch_name || ['is', 'not set'],
 			},
 		}
 	},
@@ -328,6 +333,7 @@ const certificateDetails = createResource({
 			filters: {
 				member: props.event.member,
 				course: props.event.course,
+				batch_name: props.event.batch_name || ['is', 'not set'],
 			},
 		}
 	},
