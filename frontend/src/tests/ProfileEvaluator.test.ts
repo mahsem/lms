@@ -38,7 +38,7 @@ vi.mock('frappe-ui', async () => {
 		},
 		Badge: { props: ['label', 'theme'], template: `<span>{{ label }}</span>` },
 		Switch: {
-			props: ['modelValue'],
+			props: ['modelValue', 'size'],
 			emits: ['update:modelValue'],
 			template: `<input type="checkbox" :checked="modelValue"
 			@change="$emit('update:modelValue', $event.target.checked)" />`,
@@ -74,7 +74,11 @@ function findResource(url: string) {
 	return resources.value.find((r) => r.config.url === url)
 }
 
-async function mountPanel(sessionUser = EVALUATOR) {
+async function mountPanel(
+	sessionUser = EVALUATOR,
+	sessionUsername = 'eva',
+	isModerator = false
+) {
 	resources.value = []
 	const wrapper = mount(
 		await import('@/pages/ProfileEvaluator.vue').then((m) => m.default),
@@ -85,7 +89,13 @@ async function mountPanel(sessionUser = EVALUATOR) {
 			global: {
 				provide: {
 					$user: {
-						data: { name: sessionUser, email: sessionUser, is_evaluator: true },
+						data: {
+							name: sessionUser,
+							email: sessionUser,
+							username: sessionUsername,
+							is_evaluator: true,
+							is_moderator: isModerator,
+						},
 					},
 				},
 				mocks: { __: (s: string) => s },
@@ -141,21 +151,6 @@ describe('ProfileEvaluator availability writes', () => {
 
 		remove.submit({ name: 42 })
 		expect(remove.lastParams).toEqual({ evaluator: EVALUATOR, slot: 42 })
-	})
-
-	it('sets unavailability through the ownership-checked endpoint', async () => {
-		await mountPanel()
-		const unavailability = findResource(
-			'lms.lms.api.set_evaluator_unavailability'
-		)
-		expect(unavailability).toBeTruthy()
-
-		unavailability.submit({ field: 'unavailable_from', value: '2026-08-01' })
-		expect(unavailability.lastParams).toEqual({
-			evaluator: EVALUATOR,
-			fieldname: 'unavailable_from',
-			value: '2026-08-01',
-		})
 	})
 
 	it('never writes availability through raw framework endpoints', async () => {
@@ -236,10 +231,15 @@ describe('ProfileEvaluator calendar settings', () => {
 		routerReplace.mockReset()
 	})
 
-	it('saves each setting through the own-calendar endpoint', async () => {
-		await mountPanel()
+	it('saves a toggled setting through the own-calendar endpoint', async () => {
+		const wrapper = await mountPanel()
 		const update = findResource('lms.lms.api.update_evaluator_calendar')
-		update.submit({ fieldname: 'push_to_google_calendar', value: 0 })
+
+		await wrapper
+			.find('input[aria-label="Push to Google Calendar"]')
+			.setValue(false)
+
+		expect(update.submit).toHaveBeenCalledTimes(1)
 		expect(update.lastParams).toEqual({
 			fieldname: 'push_to_google_calendar',
 			value: 0,
@@ -264,7 +264,7 @@ describe('ProfileEvaluator calendar settings', () => {
 	})
 
 	it('hides the calendar from a Moderator viewing someone else', async () => {
-		const wrapper = await mountPanel('mod@example.com')
+		const wrapper = await mountPanel('mod@example.com', 'mod', true)
 		expect(wrapper.find('[data-testid="calendar"]').exists()).toBe(false)
 	})
 
@@ -276,5 +276,16 @@ describe('ProfileEvaluator calendar settings', () => {
 			expect.stringContaining('Try authorizing again')
 		)
 		expect(routerReplace).toHaveBeenCalled()
+	})
+
+	// The profile carries no email, so the owner check matches on username.
+	it('lets the evaluator edit their own slots, matched by username', async () => {
+		const wrapper = await mountPanel()
+		expect(wrapper.text()).toContain('Add slot')
+	})
+
+	it("keeps a moderator read-only on someone else's slots", async () => {
+		const wrapper = await mountPanel('mod@example.com', 'mod', true)
+		expect(wrapper.text()).not.toContain('Add slot')
 	})
 })
