@@ -1,3 +1,4 @@
+import functools
 import hashlib
 import json
 import re
@@ -17,6 +18,7 @@ from frappe.rate_limiter import rate_limit
 from frappe.utils import (
 	add_months,
 	cint,
+	date_diff,
 	escape_html,
 	flt,
 	fmt_money,
@@ -33,6 +35,7 @@ from frappe.utils import (
 	to_timedelta,
 	validate_email_address,
 )
+from frappe.utils.dateutils import get_period_ending
 from frappe.utils.html_utils import sanitize_html
 from pypika import Case
 from pypika import functions as fn
@@ -382,13 +385,34 @@ def get_average_rating(course: str):
 	return sum(ratings) / len(ratings)
 
 
+def guest_access_allowed():
+	allow_guest_access = frappe.get_cached_value("LMS Settings", None, "allow_guest_access")
+	if frappe.session.user == "Guest" and not allow_guest_access:
+		return False
+	return True
+
+
+def guest_access_required(empty):
+	"""Serve guests only when the site allows guest access; otherwise return `empty()`, such as
+	list or int, so the caller gets an empty result of the usual type."""
+
+	def decorator(fn):
+		@functools.wraps(fn)
+		def wrapper(*args, **kwargs):
+			if not guest_access_allowed():
+				return empty()
+			return fn(*args, **kwargs)
+
+		return wrapper
+
+	return decorator
+
+
 # nosemgrep: security.guest-whitelisted-method - pre-existing grant, unchanged by this branch; the endpoint gates itself (guests get [] unless guest access is on and the course is published). Flagged only because semgrep ci re-scans the whole function when its body changes.
 @frappe.whitelist(allow_guest=True)
 @rate_limit(limit=500, seconds=60 * 60)
+@guest_access_required(list)
 def get_reviews(course: str):
-	if not guest_access_allowed():
-		return []
-
 	is_course_published = frappe.db.get_value("LMS Course", course, "published")
 	if not is_course_published and not can_modify_course(course) and not get_membership(course):
 		return []
@@ -451,15 +475,23 @@ def get_progress(course: str, lesson: str, member: str = None):
 
 def get_course_progress(course: str, member: str = None):
 	"""Returns the course progress of the session user"""
-	lesson_count = get_lesson_count(course)
-	if not lesson_count:
+	chapters = frappe.get_all("Chapter Reference", {"parent": course}, pluck="chapter")
+	if not chapters:
+		return 0
+	lessons = frappe.get_all("Lesson Reference", {"parent": ("in", chapters)}, pluck="lesson")
+	if not lessons:
 		return 0
 	completed_lessons = frappe.db.count(
 		"LMS Course Progress",
-		{"course": course, "member": member or frappe.session.user, "status": "Complete"},
+		{
+			"course": course,
+			"member": member or frappe.session.user,
+			"status": "Complete",
+			"lesson": ("in", lessons),
+		},
 	)
 	precision = cint(frappe.db.get_default("float_precision")) or 3
-	return flt(((completed_lessons / lesson_count) * 100), precision)
+	return flt(min(completed_lessons / len(lessons) * 100, 100), precision)
 
 
 def is_instructor(course: str) -> bool:
@@ -791,11 +823,14 @@ def get_lesson_count(course: str) -> int:
 
 
 STATISTICS_CHARTS = ("New Signups", "Course Enrollments", "Certification")
+CHART_TIMEGRAINS = ("Daily", "Weekly", "Monthly", "Quarterly", "Yearly")
+MAX_CHART_PERIODS = 366
 
 
 # nosemgrep: security.guest-whitelisted-method - pre-existing grant; this branch narrows it to the Statistics charts. Flagged only because the body changed.
 @frappe.whitelist(allow_guest=True)
 @rate_limit(limit=500, seconds=60 * 60)
+@guest_access_required(list)
 def get_chart_data(
 	chart_name: str,
 	timegrain: str = "Daily",
@@ -804,6 +839,9 @@ def get_chart_data(
 ):
 	if not isinstance(chart_name, str) or chart_name not in STATISTICS_CHARTS:
 		frappe.throw(_("This chart is not available."), frappe.PermissionError)
+
+	if timegrain not in CHART_TIMEGRAINS:
+		frappe.throw(_("Show the chart by day, week, month, quarter or year."))
 
 	try:
 		chart = frappe.get_doc("Dashboard Chart", chart_name)
@@ -814,7 +852,7 @@ def get_chart_data(
 	if not chart.is_public and not frappe.has_permission("Dashboard Chart", "read", doc=chart):
 		frappe.throw(_("This chart is not available."), frappe.PermissionError)
 
-	from_date, to_date = get_chart_date_range(from_date, to_date)
+	from_date, to_date = get_chart_date_range(from_date, to_date, timegrain)
 	doctype = chart.document_type
 	datefield = chart.based_on
 	value_field = chart.value_based_on or "1"
@@ -832,7 +870,7 @@ def get_chart_data(
 	return data
 
 
-def get_chart_date_range(from_date: str, to_date: str):
+def get_chart_date_range(from_date: str, to_date: str, timegrain: str = "Daily"):
 	if not from_date:
 		from_date = add_months(getdate(), -1)
 	if not to_date:
@@ -841,7 +879,25 @@ def get_chart_date_range(from_date: str, to_date: str):
 	from_date = get_datetime(from_date).strftime("%Y-%m-%d")
 	to_date = get_datetime(to_date)
 
+	days = date_diff(to_date, from_date)
+	if days < 0:
+		frappe.throw(_("Choose an end date on or after the start date."))
+	# Each period in the range becomes a row, so a wide range means a slow, large response.
+	if count_chart_periods(from_date, to_date, timegrain) > MAX_CHART_PERIODS:
+		frappe.throw(_("Choose a shorter date range, or show the chart by a longer period."))
+
 	return from_date, to_date
+
+
+def count_chart_periods(from_date, to_date, timegrain: str) -> int:
+	"""The rows frappe's get_result makes for this range: one per period end, from the period
+	holding from_date to the one holding to_date."""
+	start = get_period_ending(from_date, timegrain)
+	end = get_period_ending(to_date, timegrain)
+	if timegrain in ("Daily", "Weekly"):
+		return (end - start).days // (1 if timegrain == "Daily" else 7) + 1
+	months = (end.year - start.year) * 12 + end.month - start.month
+	return months // {"Monthly": 1, "Quarterly": 3, "Yearly": 12}[timegrain] + 1
 
 
 def get_chart_filters(doctype: str, chart: object, datefield: str, from_date: str, to_date: str):
@@ -885,8 +941,10 @@ def get_chart_details(
 		)
 
 
+# nosemgrep: security.guest-whitelisted-method - pre-existing grant, unchanged by this branch; guests are served only when guest access is on. Flagged only because the body changed.
 @frappe.whitelist(allow_guest=True)
 @rate_limit(limit=500, seconds=60 * 60)
+@guest_access_required(list)
 def get_course_completion_data():
 	all_membership = frappe.db.count("LMS Enrollment")
 	completed = frappe.db.count("LMS Enrollment", {"progress": ["like", "%100%"]})
@@ -1223,13 +1281,6 @@ def get_current_exchange_rate(source: str, target: str = "USD") -> float:
 	return details["rates"][target]
 
 
-def guest_access_allowed():
-	allow_guest_access = frappe.get_cached_value("LMS Settings", None, "allow_guest_access")
-	if frappe.session.user == "Guest" and not allow_guest_access:
-		return False
-	return True
-
-
 SELF_SCOPED_FILTERS = ("created", "enrolled")
 
 
@@ -1329,7 +1380,7 @@ DEFAULT_PAGE_LENGTH = 24
 MAX_PAGE_LENGTH = 120
 
 
-def resolve_page_length(limit_page_length=None) -> int:
+def resolve_page_length(limit_page_length=None, default: int = DEFAULT_PAGE_LENGTH) -> int:
 	"""How many rows a list endpoint returns for a client-supplied page size.
 
 	`createListResource` sends `limit_page_length` and advances `start` by the
@@ -1337,17 +1388,15 @@ def resolve_page_length(limit_page_length=None) -> int:
 	size and the next page repeats rows. Bounded because these endpoints are
 	open to guests and an unbounded page size is a cheap way to ask for a table.
 	"""
-	page_length = cint(limit_page_length) or DEFAULT_PAGE_LENGTH
+	page_length = cint(limit_page_length) or default
 	return min(max(page_length, 1), MAX_PAGE_LENGTH)
 
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 @rate_limit(limit=500, seconds=60 * 60)
+@guest_access_required(list)
 def get_courses(filters: dict = None, start: int = 0, limit_page_length: int | str = None) -> list:
 	"""Returns the list of courses."""
-
-	if not guest_access_allowed():
-		return []
 
 	filters = check_list_filters(filters, COURSE_LIST_FILTERS)
 
@@ -1391,6 +1440,7 @@ def get_courses(filters: dict = None, start: int = 0, limit_page_length: int | s
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 @rate_limit(limit=500, seconds=60 * 60)
+@guest_access_required(int)
 def get_course_count(filters: dict = None) -> int:
 	"""How many courses the same filters `get_courses` takes actually match.
 
@@ -1399,9 +1449,6 @@ def get_course_count(filters: dict = None) -> int:
 	title search is an or_filter. Both only exist once `update_course_filters`
 	has resolved them.
 	"""
-	if not guest_access_allowed():
-		return 0
-
 	filters = check_list_filters(filters, COURSE_LIST_FILTERS)
 
 	self_scoped = is_self_scoped(filters)
@@ -1441,13 +1488,12 @@ def as_filter_conditions(filters: dict) -> list:
 	return conditions
 
 
+# nosemgrep: security.guest-whitelisted-method - pre-existing grant, unchanged by this branch; guests are served only when guest access is on. Flagged only because the body changed.
 @frappe.whitelist(allow_guest=True)
 @rate_limit(limit=500, seconds=60 * 60)
+@guest_access_required(list)
 def get_course_categories() -> list:
 	"""Returns the full, unfiltered list of categories used by published courses."""
-
-	if not guest_access_allowed():
-		return []
 
 	# Distinct category strings are inherently bounded (one per category, not per
 	# course), so the full set is intended; limit_page_length=0 makes the
@@ -1598,10 +1644,8 @@ def get_course_fields():
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 @rate_limit(limit=500, seconds=60 * 60)
+@guest_access_required(dict)
 def get_course_details(course: str):
-	if not guest_access_allowed():
-		return {}
-
 	is_course_published = frappe.db.get_value("LMS Course", course, "published")
 	membership = get_membership(course)
 	if not is_course_published and not can_modify_course(course) and not membership:
@@ -1681,14 +1725,12 @@ def get_categorized_courses(courses: list) -> dict:
 
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
+@guest_access_required(list)
 def get_course_outline(course: str, progress: bool = False) -> list:
 	"""Returns the course outline."""
 
 	if not isinstance(course, str):
 		frappe.throw(_("Course must be a string."))
-
-	if not guest_access_allowed():
-		return []
 
 	if not can_view_course(course):
 		return []
@@ -1957,10 +1999,8 @@ def _gate_redirect(course: str) -> dict:
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 @rate_limit(limit=500, seconds=60 * 60)
+@guest_access_required(dict)
 def get_lesson(course: str, chapter: int, lesson: int) -> dict:
-	if not guest_access_allowed():
-		return {}
-
 	# Local import: permissions imports from utils at module load.
 	from lms.lms.permissions import can_access_course
 
@@ -2132,10 +2172,8 @@ def get_neighbour_lesson(course: str, chapter: int, lesson: int) -> dict:
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 @rate_limit(limit=500, seconds=60 * 60)
+@guest_access_required(dict)
 def get_batch_details(batch: str):
-	if not guest_access_allowed():
-		return {}
-
 	from lms.lms.permissions import can_instruct_batch, evaluates_batch
 
 	batch_students = frappe.get_all("LMS Batch Enrollment", {"batch": batch}, pluck="member")
@@ -2389,12 +2427,11 @@ def get_assignment(name: str) -> dict:
 	return enrich_schedule_payload(doc.as_dict())
 
 
+# nosemgrep: security.guest-whitelisted-method - pre-existing grant, unchanged by this branch; guests are served only when guest access is on. Flagged only because the body changed.
 @frappe.whitelist(allow_guest=True)
 @rate_limit(limit=500, seconds=60 * 60)
+@guest_access_required(list)
 def get_batch_courses(batch: str) -> list:
-	if not guest_access_allowed():
-		return []
-
 	courses = []
 	course_list = frappe.get_all("Batch Course", {"parent": batch}, ["name", "course"])
 
@@ -2826,15 +2863,20 @@ def get_discussion_topics(doctype: str, docname: str, single_thread: bool = Fals
 		order_by="creation desc",
 	)
 
+	# Counted with the query builder rather than a SQL count in `fields`: newer
+	# frappe versions refuse functions written as strings there, and the dict
+	# form is not in v15.
 	reply_counts = {}
 	if topics:
-		for row in frappe.get_all(
-			"Discussion Reply",
-			filters={"topic": ["in", [topic.name for topic in topics]]},
-			fields=["topic", "count(name) as count"],
-			group_by="topic",
-		):
-			reply_counts[row.topic] = row.count
+		Reply = frappe.qb.DocType("Discussion Reply")
+		rows = (
+			frappe.qb.from_(Reply)
+			.select(Reply.topic, fn.Count(Reply.name).as_("count"))
+			.where(Reply.topic.isin([topic.name for topic in topics]))
+			.groupby(Reply.topic)
+			.run(as_dict=True)
+		)
+		reply_counts = {row.topic: row.count for row in rows}
 
 	for topic in topics:
 		topic.user = frappe.db.get_value("User", topic.owner, ["full_name", "user_image"], as_dict=True)
@@ -3394,7 +3436,10 @@ def get_program_details(program_name: str) -> dict:
 		"LMS Program Member", {"parent": program_name, "member": frappe.session.user}
 	)
 	if not is_published and not is_member:
-		frappe.throw(_("You are not authorized to view the details of this program."))
+		if not frappe.db.exists("LMS Program", program_name) or not frappe.has_permission(
+			"LMS Program", "write", program_name
+		):
+			frappe.throw(_("You are not authorized to view the details of this program."))
 
 	program = frappe.db.get_value(
 		"LMS Program",
@@ -3463,15 +3508,13 @@ def validate_program_enrollment(program: str):
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 @rate_limit(limit=500, seconds=60 * 60)
+@guest_access_required(list)
 def get_batches(
 	filters: dict = None,
 	start: int = 0,
 	order_by: str | None = "start_date",
 	limit_page_length: int | str = None,
 ):
-	if not guest_access_allowed():
-		return []
-
 	filters = check_list_filters(filters, BATCH_LIST_FILTERS)
 	# Batches sort by start date only; anything else falls back to the default.
 	order_by = " ".join(order_by.lower().split()) if isinstance(order_by, str) else ""
@@ -3524,6 +3567,7 @@ def update_batch_filters(filters: dict) -> None:
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 @rate_limit(limit=500, seconds=60 * 60)
+@guest_access_required(int)
 def get_batch_count(filters: dict = None) -> int:
 	"""How many batches the same filters `get_batches` takes actually match.
 
@@ -3535,9 +3579,6 @@ def get_batch_count(filters: dict = None) -> int:
 	pass over them: the endpoint is open to guests, so the work it does must not
 	grow with the number of batches on the site.
 	"""
-	if not guest_access_allowed():
-		return 0
-
 	filters = check_list_filters(filters, BATCH_LIST_FILTERS)
 
 	self_scoped = is_self_scoped(filters)
@@ -3666,12 +3707,11 @@ def get_palette(full_name: str) -> list:
 	return palette[idx % 8]
 
 
+# nosemgrep: security.guest-whitelisted-method - pre-existing grant, unchanged by this branch; guests are served only when guest access is on. Flagged only because the body changed.
 @frappe.whitelist(allow_guest=True)
 @rate_limit(limit=500, seconds=60 * 60)
+@guest_access_required(list)
 def get_related_courses(course: str) -> list:
-	if not guest_access_allowed():
-		return []
-
 	related_course_details = []
 	related_courses = frappe.get_all("Related Courses", {"parent": course}, order_by="idx", pluck="course")
 

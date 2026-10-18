@@ -46,18 +46,15 @@ test.describe("Course Creation", () => {
 		await page.goto("/lms/courses");
 
 		// Open New Course modal
-		await button(page, "Create").click();
-		await page.getByRole("menuitem", { name: "New Course" }).click();
+		await button(page, "New Course").click();
 
-		// The form is a route now (NewCourseForm.vue), and the Create dropdown
-		// that opened it is a dismissable layer that outlives the click, so
-		// scope to the form's own fields rather than to the last layer on the
-		// page.
+		// The form is a route now (NewCourseForm.vue); scope to its own fields
+		// rather than to the last layer on the page.
 		//
-		// No whole-wrapper visibility assertion: the form is taller than a
-		// typical CI viewport, and Playwright's per-locator actions already
-		// auto-wait and auto-scroll the specific element they touch — the
-		// wrapper itself never needs to be "visible" as a whole.
+		// No whole-wrapper visibility assertion: the fields scroll inside the
+		// dialog on a short CI viewport, and Playwright's per-locator actions
+		// already auto-wait and auto-scroll the specific element they touch —
+		// the wrapper itself never needs to be "visible" as a whole.
 		const fields = page.getByTestId("new-course-fields");
 		await fields
 			.locator("label")
@@ -66,27 +63,16 @@ test.describe("Course Creation", () => {
 			.locator("input")
 			.fill(courseTitle);
 
-		// Instructors: MultiSelect
-		await fields
-			.locator("label")
-			.filter({ hasText: "Instructors" })
-			.locator("xpath=..")
-			.locator("button")
-			.first()
-			.click();
-
-		await page
-			.locator('[data-slot="content-body"] [data-slot="input"]')
-			.fill("frappe");
-		// Cypress budgeted a 10s find plus its own 20s default actionability
-		// wait (~30s combined); a single Playwright `.click({timeout})` covers
-		// both the find and the actionability wait in one window, so match
-		// the combined budget rather than just the find half of it.
-		await page
-			.locator('[data-slot="content-body"] [role="option"]')
-			.first()
-			.click({ timeout: 30000 });
-		await page.keyboard.press("Escape");
+		// The form pre-fills the signed-in user as instructor; clicking their
+		// option would deselect them and the form now refuses to save.
+		await expect(
+			fields
+				.locator("label")
+				.filter({ hasText: "Instructors" })
+				.locator("xpath=..")
+				.locator("button")
+				.first()
+		).toContainText("Frappe");
 
 		// Thumbnail
 		const upload = waitForApiCall(page, "/api/method/upload_file");
@@ -217,8 +203,8 @@ test.describe("Course Creation", () => {
 			.locator("xpath=..")
 			.locator("input")
 			.fill("Test Chapter");
-		// ChapterForm.vue is a form route now, and every form in the shared
-		// shell submits with "Save".
+		// ChapterForm.vue is a form route now, and a new chapter submits with
+		// "Add".
 		await chapterDialog.getByTestId("chapter-save").click();
 		await expect(page.getByText("Test Chapter")).toBeVisible({
 			timeout: 15000,
