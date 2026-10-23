@@ -3,7 +3,7 @@ import hashlib
 import json
 import re
 from datetime import date, datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
 import frappe
@@ -28,6 +28,7 @@ from frappe.utils import (
 	get_fullname,
 	get_system_timezone,
 	get_time,
+	get_url,
 	getdate,
 	nowtime,
 	rounded,
@@ -129,9 +130,17 @@ def slugify(title: str, used_slugs: list = None):
 		count = count + 1
 
 
+# A course and a batch answer at different routes, but both tag staff through
+# Course Instructor rows that several lookups key on `parent` alone, so the two
+# never take the same name.
+SLUGS_SHARED_WITH = {"LMS Course": "LMS Batch", "LMS Batch": "LMS Course"}
+
+
 def generate_slug(title: str, doctype: str, reserved: frozenset[str] = frozenset()):
-	result = frappe.get_all(doctype, fields=["name"])
-	slugs = {row["name"] for row in result} | reserved
+	slugs = set(reserved)
+	for source in (doctype, SLUGS_SHARED_WITH.get(doctype)):
+		if source:
+			slugs |= set(frappe.get_all(source, pluck="name"))
 	return slugify(title, used_slugs=slugs)
 
 
@@ -661,6 +670,9 @@ def validate_attachable_file(doc: Document, fieldname: str) -> None:
 		)
 
 
+MAX_MENTIONS_PER_REPLY = 10
+
+
 def handle_notifications(doc: Document, method: str):
 	topic = frappe.db.get_value(
 		"Discussion Topic",
@@ -732,8 +744,19 @@ def create_notification_log(doc: Document, topic: dict):
 	make_notification_logs(notification, users)
 
 
+def mentioned_users(html: str) -> list[str]:
+	"""The Users behind a reply's mentions. The editor stores usernames; replies
+	written before it did hold login emails, which resolve_user takes as well."""
+	users = []
+	for mention in extract_mentions(html):
+		user = resolve_user(mention)
+		if user and user not in users:
+			users.append(user)
+	return users
+
+
 def notify_mentions_on_portal(doc: Document, topic: dict):
-	mentions = extract_mentions(doc.reply)
+	mentions = get_mention_recipients(doc, topic)
 	if not mentions:
 		return
 
@@ -775,7 +798,7 @@ def notify_mentions_via_email(doc: Document, topic: dict):
 	if not outgoing_email_account or not frappe.conf.get("mail_login"):
 		return
 
-	mentions = extract_mentions(doc.reply)
+	mentions = get_mention_recipients(doc, topic)
 	if not mentions:
 		return
 
@@ -813,6 +836,33 @@ def notify_mentions_via_email(doc: Document, topic: dict):
 			header=[subject, "green"],
 			retry=3,
 		)
+
+
+def get_mention_recipients(doc: Document, topic: dict) -> list[str]:
+	mentions = mentioned_users(doc.reply)[:MAX_MENTIONS_PER_REPLY]
+	if not mentions:
+		return []
+	users = frappe.get_all(
+		"User", {"name": ("in", mentions), "enabled": 1, "allowed_in_mentions": 1}, pluck="name"
+	)
+	return [user for user in users if is_topic_participant(user, topic)]
+
+
+def is_topic_participant(user: str, topic: dict) -> bool:
+	from lms.lms.permissions import can_author_batch, can_author_course
+
+	if topic.reference_doctype == "Course Lesson":
+		course = frappe.db.get_value("Course Lesson", topic.reference_docname, "course")
+		return bool(
+			frappe.db.exists("LMS Enrollment", {"course": course, "member": user})
+			or can_author_course(course, user=user)
+		)
+	batch = topic.reference_docname
+	return bool(
+		frappe.db.exists("LMS Batch Enrollment", {"batch": batch, "member": user})
+		or has_evaluator_role(user)
+		or can_author_batch(batch, user=user)
+	)
 
 
 def get_lesson_count(course: str) -> int:
@@ -1561,7 +1611,9 @@ def update_course_filters(filters: dict) -> tuple:
 
 	if filters.get("created"):
 		created_courses = frappe.get_all(
-			"Course Instructor", {"instructor": frappe.session.user}, pluck="parent"
+			"Course Instructor",
+			{"instructor": frappe.session.user, "parenttype": "LMS Course"},
+			pluck="parent",
 		)
 		filters.update({"name": ["in", created_courses]})
 		del filters["created"]
@@ -2175,11 +2227,25 @@ def get_neighbour_lesson(course: str, chapter: int, lesson: int) -> dict:
 	}
 
 
+def can_view_batch(batch: str) -> bool:
+	"""Who reads a batch: anyone once it is published, its students, and its staff."""
+	from lms.lms.permissions import can_author_batch
+
+	if frappe.db.get_value("LMS Batch", batch, "published"):
+		return True
+	if frappe.db.exists("LMS Batch Enrollment", {"batch": batch, "member": frappe.session.user}):
+		return True
+	return can_author_batch(batch)
+
+
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 @rate_limit(limit=500, seconds=60 * 60)
 @guest_access_required(dict)
 def get_batch_details(batch: str):
 	from lms.lms.permissions import can_instruct_batch, evaluates_batch
+
+	if not can_view_batch(batch):
+		return {}
 
 	batch_students = frappe.get_all("LMS Batch Enrollment", {"batch": batch}, pluck="member")
 	# can_modify_batch only recognises the Course Instructor tag; can_manage, like
@@ -2187,11 +2253,7 @@ def get_batch_details(batch: str):
 	# Creator may hold instead. Only instructors schedule live classes.
 	instructs = can_instruct_batch(batch)
 	can_manage = instructs or evaluates_batch(batch)
-	is_batch_published = frappe.db.get_value("LMS Batch", batch, "published")
 	is_student_enrolled = frappe.session.user in batch_students
-
-	if not (is_batch_published or can_manage or is_student_enrolled):
-		return {}
 
 	batch_details = frappe.db.get_value(
 		"LMS Batch",
@@ -2437,6 +2499,9 @@ def get_assignment(name: str) -> dict:
 @rate_limit(limit=500, seconds=60 * 60)
 @guest_access_required(list)
 def get_batch_courses(batch: str) -> list:
+	if not can_view_batch(batch):
+		return []
+
 	courses = []
 	course_list = frappe.get_all("Batch Course", {"parent": batch}, ["name", "course"])
 
@@ -2451,11 +2516,11 @@ def get_batch_courses(batch: str) -> list:
 
 @frappe.whitelist()
 def get_assessments(batch: str) -> list:
-	from lms.lms.permissions import can_author_batch
+	from lms.lms.permissions import can_author_batch, evaluator_role_reads_batch
 
 	member = frappe.session.user
 	is_enrolled = frappe.db.exists("LMS Batch Enrollment", {"batch": batch, "member": member})
-	is_admin = "Batch Evaluator" in frappe.get_roles(member) or can_author_batch(batch, user=member)
+	is_admin = evaluator_role_reads_batch(batch, user=member) or can_author_batch(batch, user=member)
 	if not is_enrolled and not is_admin:
 		frappe.throw(_("You are not authorized to view the assessments of this batch."))
 
@@ -2678,9 +2743,9 @@ def get_quiz_pass_stats(batch: str) -> list:
 @frappe.whitelist()
 def get_batch_chart_data(batch: str) -> list:
 	"""Get completion counts per course and assessment"""
-	from lms.lms.permissions import can_author_batch
+	from lms.lms.permissions import can_author_batch, evaluator_role_reads_batch
 
-	if "Batch Evaluator" not in frappe.get_roles() and not can_author_batch(batch):
+	if not evaluator_role_reads_batch(batch) and not can_author_batch(batch):
 		frappe.throw(_("You are not authorized to view the chart data of this batch."))
 	if not frappe.db.exists("LMS Batch", batch):
 		frappe.throw(_("The specified batch does not exist."))
@@ -2833,14 +2898,17 @@ def can_access_topic(doctype: str, docname: str) -> bool:
 		if not is_student and not can_modify_course(course):
 			return False
 	elif doctype == "LMS Batch":
-		from lms.lms.permissions import can_author_batch
+		from lms.lms.permissions import can_author_batch, evaluator_role_reads_batch
 
 		is_student = frappe.db.exists(
 			"LMS Batch Enrollment", {"batch": docname, "member": frappe.session.user}
 		)
-		is_admin = "Batch Evaluator" in frappe.get_roles() or can_author_batch(docname)
+		is_admin = evaluator_role_reads_batch(docname) or can_author_batch(docname)
 		if not is_student and not is_admin:
 			return False
+	else:
+		# Only lessons and batches carry discussions.
+		return False
 	return True
 
 
@@ -3066,7 +3134,8 @@ def calculate_discount_amount(base_amount: float, coupon: dict) -> float:
 
 @frappe.whitelist()
 def get_lesson_creation_details(course: str, chapter: int, lesson: int) -> dict:
-	frappe.only_for(["Moderator", "Course Creator"])
+	if not can_modify_course(course):
+		frappe.throw(_("You do not have permission to edit this course."), frappe.PermissionError)
 	chapter_name = frappe.db.get_value("Chapter Reference", {"parent": course, "idx": chapter}, "chapter")
 	lesson_name = frappe.db.get_value("Lesson Reference", {"parent": chapter_name, "idx": lesson}, "lesson")
 
@@ -3746,6 +3815,9 @@ def validate_discussion_reply(doc: Document, method: str):
 	elif topic.reference_doctype == "LMS Batch":
 		validate_batch_access(topic.reference_docname)
 
+	else:
+		frappe.throw(_("Replies can only be posted under a lesson or a batch."), frappe.PermissionError)
+
 
 def validate_course_access(lesson: str):
 	if not frappe.db.exists("Course Lesson", lesson):
@@ -3867,7 +3939,7 @@ def sanitize_editorjs(raw):
 	"""
 	try:
 		data, _repaired = load_editorjs(raw)
-		return dump_editorjs(sanitize_json(data))
+		return dump_editorjs(drop_unsafe_embeds(sanitize_json(data)))
 	except (TypeError, ValueError, RecursionError):
 		return escape_markup(raw)
 
@@ -3922,6 +3994,39 @@ def sanitize_json(node, depth=0):
 	if isinstance(node, str) and ("<" in node or ">" in node):
 		return sanitize_html(node, always_sanitize=True)
 	return node
+
+
+# The embed tool writes `data.embed` into an iframe `src` as is.
+SAFE_EMBED_URL = re.compile(r"https?://[^\s\\\x00-\x1f\x7f]+", re.IGNORECASE)
+YOUTUBE_VIDEO_ID = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def is_safe_embed(data):
+	url = data.get("embed")
+	if not isinstance(url, str):
+		return False
+	if data.get("service") == "youtube" and YOUTUBE_VIDEO_ID.fullmatch(url):
+		return True
+	if not SAFE_EMBED_URL.fullmatch(url):
+		return False
+	try:
+		host = urlsplit(url).hostname
+	except ValueError:
+		return False
+	return bool(host) and host not in {frappe.local.site, urlsplit(get_url()).hostname}
+
+
+def drop_unsafe_embeds(data):
+	"""Drop embed blocks whose iframe source is not an external http(s) URL."""
+	if not isinstance(data, dict) or not isinstance(data.get("blocks"), list):
+		return data
+	data["blocks"] = [
+		block
+		for block in data["blocks"]
+		if not (isinstance(block, dict) and block.get("type") == "embed")
+		or (isinstance(block.get("data"), dict) and is_safe_embed(block["data"]))
+	]
+	return data
 
 
 # Rows written before `content` carried `ignore_xss_filter` were mangled by nh3
