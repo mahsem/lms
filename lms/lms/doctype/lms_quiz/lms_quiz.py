@@ -69,6 +69,14 @@ MAX_VIOLATION_FRAMES = 40
 
 
 class LMSQuiz(AuthoredDocument, Document):
+	def throw_length_exceeded_error(self, df, max_length, value):
+		if df.fieldname == "title":
+			frappe.throw(
+				_("Title must be {0} characters or fewer.").format(max_length),
+				frappe.CharacterLengthExceededError,
+			)
+		super().throw_length_exceeded_error(df, max_length, value)
+
 	def validate(self):
 		self.validate_duplicate_questions()
 		self.validate_limit()
@@ -517,9 +525,13 @@ def _save_violation_frame(log_name: str, data_url: str) -> bool:
 
 @frappe.whitelist()
 def is_open_ended_submission(submission: str) -> bool:
-	quiz = frappe.db.get_value("LMS Quiz Submission", submission, "quiz")
+	quiz, member = frappe.db.get_value("LMS Quiz Submission", submission, ["quiz", "member"]) or (None, None)
 	if not quiz:
 		return False
+	if member != frappe.session.user and not frappe.has_permission("LMS Quiz Submission", "read", submission):
+		frappe.throw(_("Insufficient Permission"), frappe.PermissionError)
+	# A quiz is open ended as a whole (validate_open_ended_questions), so its first
+	# question decides.
 	question_type = frappe.db.get_value("LMS Quiz Question", {"parent": quiz}, "type")
 	return question_type == "Open Ended"
 
