@@ -486,7 +486,7 @@ def _course_reviews(course: str) -> list:
 	)
 	out_of_ratings = (len(out_of_ratings) and out_of_ratings[0].options) or 5
 	for review in reviews:
-		review.rating = review.rating * out_of_ratings
+		review.rating = (review.rating or 0) * out_of_ratings
 		review.owner_details = frappe.db.get_value(
 			"User", review.owner, ["username", "full_name", "user_image"], as_dict=True
 		)
@@ -4212,6 +4212,19 @@ def get_editorjs_blocks(content):
 			continue
 		valid_blocks.append(block)
 	return valid_blocks
+
+
+def _latest_exercise_submissions(exercises: list, member: str) -> dict:
+	"""The member's latest submission of each programming exercise, by exercise."""
+	latest = {}
+	for row in frappe.get_all(
+		"LMS Programming Exercise Submission",
+		filters={"exercise": ["in", [name for name in exercises if name] or [""]], "member": member},
+		fields=["name", "status", "exercise", "exercise_title", "creation"],
+		order_by="creation desc",
+	):
+		latest.setdefault(row.exercise, row)
+	return latest
 
 
 # EditorJS nests a handful of levels, and a nested list adds two per level.
