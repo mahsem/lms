@@ -1,5 +1,6 @@
 """
-Run the full server, UI and frontend suites on develop and version-16 every hour, and post a status on the
+Run the full server, UI and frontend suites on develop and version-16 after each push to develop and every
+three hours, and post a status on the
 pull requests waiting to land there. Pull requests skip those suites, so this status is how they
 see the branch: failing while the latest full run on it failed, unless the pull request carries
 the fix label and the failing suites passed on it.
@@ -12,12 +13,14 @@ Usage:
     python branch_status.py pr <number>   # one pull request
     python branch_status.py commit <sha>  # the pull requests whose head is this commit
     python branch_status.py alert <run>   # tell Raven when this full run failed, and which pull requests may have caused it
+    python branch_status.py alerts        # wait for the full runs, then tell Raven of each suite whose latest run failed
 
 The alert posts to the Raven incoming webhook in RAVEN_WEBHOOK_URL, or prints the message when it is unset.
 """
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -221,7 +224,9 @@ def start(force):
 		for workflow in SUITES:
 			last = next(iter(branch_runs(workflow, branch)), None)
 			if not force and last:
-				if last["status"] != "completed" or last["head_sha"] == head:
+				# Full runs of a suite on a branch share a concurrency group: a new one waits for the
+				# running one, so a commit that lands mid-run is not left for the next check.
+				if last["head_sha"] == head:
 					continue
 				changes = gh(f"repos/{REPO}/compare/{last['head_sha']}...{head}")["files"]
 				files = [
@@ -260,6 +265,19 @@ def merged_between(branch, good_sha, bad_sha):
 	return sorted(pulls.values(), key=lambda pr: pr["merged_at"])
 
 
+# The most recent pull requests an alert lists; a branch that has failed for long lists dozens.
+ALERT_PULLS = 10
+BACKPORT = re.compile(r"\(backport #(\d+)\)")
+
+
+def owner(pr):
+	"""Who to ask about a pull request: for a backport opened by a bot, the original's author."""
+	original = BACKPORT.search(pr["title"])
+	if pr["user"]["type"] == "Bot" and original:
+		return gh(f"repos/{REPO}/pulls/{original.group(1)}")["user"]["login"]
+	return pr["user"]["login"]
+
+
 def alert(run_id):
 	"""Tell Raven that a full run on a tested branch failed, with the pull requests merged since the
 	suite last passed there, and their authors."""
@@ -268,7 +286,7 @@ def alert(run_id):
 	if run["event"] != "workflow_dispatch" or branch not in BRANCHES or workflow not in SUITES:
 		return
 	state, job_url = suite_result(run, workflow)
-	if state != "failure":
+	if state != "failure" or told(run):
 		return
 
 	earlier = [r for r in branch_runs(workflow, branch) if r["created_at"] < run["created_at"]]
@@ -288,12 +306,11 @@ def alert(run_id):
 	else:
 		# The branch also moves with Frappe, so these are suspects, not a verdict.
 		lines.append(f"Merged since it last passed at `{passed['head_sha'][:7]}`:")
-		lines.append(
-			"\n".join(
-				f"- [#{pr['number']} {pr['title']}]({pr['html_url']}) by {pr['user']['login']}"
-				for pr in pulls
-			)
-		)
+		shown = pulls[-ALERT_PULLS:]
+		listed = [f"- [#{pr['number']} {pr['title']}]({pr['html_url']}) by {owner(pr)}" for pr in shown]
+		if len(pulls) > len(shown):
+			listed.append(f"- and {len(pulls) - len(shown)} earlier ones")
+		lines.append("\n".join(listed))
 		lines.append("If none of these touch the failing test, check Frappe's recent changes.")
 	message = "\n\n".join(lines)
 
@@ -309,6 +326,56 @@ def alert(run_id):
 	)
 	with urllib.request.urlopen(request, timeout=30):
 		print(f"Raven told: {suite} failed on {branch}")
+	mark_told(run, job_url)
+
+
+# How long a check waits for the full runs to finish. The UI suite alone may take an hour.
+ALERT_WAIT = 80 * 60
+
+
+def alert_failures():
+	"""Wait for the full runs on the tested branches to finish, then tell Raven of each suite whose
+	latest run failed. Runs this workflow starts with its own token finish without a workflow_run
+	event, so the check that started them waits for them instead."""
+	deadline = time.time() + ALERT_WAIT
+	time.sleep(30)  # A run just dispatched takes a moment to show in the list.
+	while time.time() < deadline and any(
+		run["status"] != "completed"
+		for branch in BRANCHES
+		for workflow in SUITES
+		for run in branch_runs(workflow, branch)[:5]
+	):
+		time.sleep(60)
+	for branch in BRANCHES:
+		for workflow in SUITES:
+			run = latest_finished(workflow, branch)
+			if run:
+				alert(run["id"])
+
+
+def latest_finished(workflow, branch):
+	return next((r for r in branch_runs(workflow, branch) if suite_result(r, workflow)[0] != "pending"), None)
+
+
+def told_context(run):
+	return f"Raven alert: {SUITES[os.path.basename(run['path'])]}"
+
+
+def told(run):
+	"""Was Raven told of this suite failing on this commit? Each check looks at the latest runs
+	again, so a failure would be told once per check without this mark."""
+	statuses = gh(f"repos/{REPO}/commits/{run['head_sha']}/status")["statuses"]
+	return any(status["context"] == told_context(run) for status in statuses)
+
+
+def mark_told(run, job_url):
+	fields = {
+		"state": "failure",
+		"context": told_context(run),
+		"description": "The team was told on Raven",
+		"target_url": job_url,
+	}
+	gh(f"repos/{REPO}/statuses/{run['head_sha']}", method="POST", body=fields)
 
 
 def refresh():
@@ -327,6 +394,8 @@ if __name__ == "__main__":
 		post(gh(f"repos/{REPO}/pulls/{sys.argv[2]}"))
 	elif command == "alert":
 		alert(sys.argv[2])
+	elif command == "alerts":
+		alert_failures()
 	elif command == "commit":
 		query = f"repo:{REPO} is:pr is:open sha:{sys.argv[2]}"
 		for item in search(query):
